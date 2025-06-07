@@ -1,0 +1,226 @@
+// main.go (Backend)
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// MaintenanceRequest defines the structure for a maintenance task.
+type MaintenanceRequest struct {
+	ID          int       `json:"id"`
+	Asset       string    `json:"asset"`
+	Description string    `json:"description"`
+	Status      string    `json:"status"` // e.g., "Pending", "In Progress", "Completed"
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+// --- In-Memory Database ---
+var (
+	requests   = make(map[int]MaintenanceRequest)
+	nextID     = 1
+	requestsMu sync.RWMutex // Mutex to handle concurrent access
+)
+
+// --- Improvements: ---
+// 1. Consistent JSON error/success responses
+// 2. Validate input for POST/PUT
+// 3. Set Content-Type for all responses
+// 4. Sort requests by CreatedAt descending
+// 5. Default status only if not provided
+
+// --- Utility Functions ---
+
+// corsMiddleware handles CORS headers to allow cross-origin requests from the frontend.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set CORS headers
+		w.Header().Set("Access-Control-Allow-Origin", "*") // Allow any origin
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+
+		// If it's an OPTIONS request, we just return with the headers.
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Otherwise, serve the next handler
+		next.ServeHTTP(w, r)
+	})
+}
+
+func respondWithError(w http.ResponseWriter, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(payload)
+}
+
+// --- API Handlers ---
+
+// requestsHandler handles requests for the /requests endpoint.
+func requestsHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		getRequests(w, r)
+	case http.MethodPost:
+		createRequest(w, r)
+	default:
+		respondWithError(w, http.StatusMethodNotAllowed, "Method not allowed")
+	}
+}
+
+// requestHandler handles requests for specific requests, e.g., /requests/{id}
+func requestHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract ID from URL path
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 3 {
+		respondWithError(w, http.StatusBadRequest, "Invalid URL")
+		return
+	}
+	id, err := strconv.Atoi(parts[2])
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request ID")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		getRequest(w, r, id)
+	case http.MethodPut:
+		updateRequest(w, r, id)
+	case http.MethodDelete:
+		deleteRequest(w, r, id)
+	default:
+		respondWithError(w, http.StatusMethodNotAllowed, "Method not allowed")
+	}
+}
+
+// getRequests retrieves all maintenance requests.
+func getRequests(w http.ResponseWriter, r *http.Request) {
+	requestsMu.RLock()
+	defer requestsMu.RUnlock()
+
+	// Create a slice from the map
+	var requestList []MaintenanceRequest
+	for _, req := range requests {
+		requestList = append(requestList, req)
+	}
+	// Sort by CreatedAt descending
+	sort.Slice(requestList, func(i, j int) bool {
+		return requestList[i].CreatedAt.After(requestList[j].CreatedAt)
+	})
+	respondWithJSON(w, http.StatusOK, requestList)
+}
+
+// createRequest adds a new maintenance request.
+func createRequest(w http.ResponseWriter, r *http.Request) {
+	var req MaintenanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Asset) == "" || strings.TrimSpace(req.Description) == "" {
+		respondWithError(w, http.StatusBadRequest, "Asset and description are required")
+		return
+	}
+	requestsMu.Lock()
+	defer requestsMu.Unlock()
+	req.ID = nextID
+	nextID++
+	if req.Status == "" {
+		req.Status = "Pending"
+	}
+	req.CreatedAt = time.Now()
+	requests[req.ID] = req
+	respondWithJSON(w, http.StatusCreated, req)
+}
+
+// getRequest retrieves a single maintenance request by its ID.
+func getRequest(w http.ResponseWriter, r *http.Request, id int) {
+	requestsMu.RLock()
+	defer requestsMu.RUnlock()
+
+	req, ok := requests[id]
+	if !ok {
+		respondWithError(w, http.StatusNotFound, "Request not found")
+		return
+	}
+	respondWithJSON(w, http.StatusOK, req)
+}
+
+// updateRequest modifies an existing maintenance request.
+func updateRequest(w http.ResponseWriter, r *http.Request, id int) {
+	requestsMu.Lock()
+	defer requestsMu.Unlock()
+
+	orig, ok := requests[id]
+	if !ok {
+		respondWithError(w, http.StatusNotFound, "Request not found")
+		return
+	}
+	var updatedReq MaintenanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&updatedReq); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(updatedReq.Asset) == "" || strings.TrimSpace(updatedReq.Description) == "" {
+		respondWithError(w, http.StatusBadRequest, "Asset and description are required")
+		return
+	}
+	updatedReq.ID = id
+	updatedReq.CreatedAt = orig.CreatedAt
+	if updatedReq.Status == "" {
+		updatedReq.Status = orig.Status
+	}
+	requests[id] = updatedReq
+	respondWithJSON(w, http.StatusOK, updatedReq)
+}
+
+// deleteRequest removes a maintenance request.
+func deleteRequest(w http.ResponseWriter, r *http.Request, id int) {
+	requestsMu.Lock()
+	defer requestsMu.Unlock()
+
+	if _, ok := requests[id]; !ok {
+		respondWithError(w, http.StatusNotFound, "Request not found")
+		return
+	}
+
+	delete(requests, id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func main() {
+	// Pre-populate with some data for demonstration
+	requests[nextID] = MaintenanceRequest{ID: nextID, Asset: "HVAC Unit - Roof", Description: "Unit is making a loud rattling noise.", Status: "Pending", CreatedAt: time.Now()}
+	nextID++
+	requests[nextID] = MaintenanceRequest{ID: nextID, Asset: "Elevator 1", Description: "Button for floor 3 is not lighting up.", Status: "In Progress", CreatedAt: time.Now()}
+	nextID++
+
+	// Create a new ServeMux
+	mux := http.NewServeMux()
+
+	// Register handlers
+	mux.HandleFunc("/requests", requestsHandler)
+	mux.HandleFunc("/requests/", requestHandler)
+
+	// Wrap the mux with the CORS middleware
+	handler := corsMiddleware(mux)
+
+	fmt.Println("Backend server is running on http://localhost:8080")
+	log.Fatal(http.ListenAndServe(":8080", handler))
+}
